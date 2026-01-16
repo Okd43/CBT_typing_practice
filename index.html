@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CBT法律タイピング練習アプリ</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel for JSX support in browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Firebase SDKs (Compat) -->
+  <script src="https://www.gstatic.com/firebasejs/11.1.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/11.1.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore-compat.js"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Noto+Sans+JP:wght@400;700;900&display=swap');
+    body { font-family: 'Inter', 'Noto Sans JP', sans-serif; }
+    .line-clamp-1 { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+    .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    /* スムーズなタイピングフィードバックのためのアニメーション */
+    .char-current { border-bottom: 2px solid #3b82f6; animation: blink 1s infinite; }
+    @keyframes blink { 0%, 100% { border-color: transparent; } 50% { border-color: #3b82f6; } }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // --- 環境変数の安全な初期化 ---
+    let firebaseConfig = {};
+    try {
+      const rawConfig = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+      if (rawConfig) {
+        firebaseConfig = typeof rawConfig === 'string' ? JSON.parse(rawConfig) : rawConfig;
+      }
+    } catch (e) {
+      console.warn("Firebase configuration could not be loaded:", e);
+    }
+
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'legal-typing-app';
+    const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    // Firebaseの初期化 (設定がある場合のみ)
+    if (firebaseConfig && firebaseConfig.apiKey) {
+      if (!firebase.apps.length) {
+        firebase.initializeApp(firebaseConfig);
+      }
+    }
+    
+    const auth = firebase.apps.length ? firebase.auth() : null;
+    const db = firebase.apps.length ? firebase.firestore() : null;
+
+    const { useState, useEffect, useRef } = React;
+
+    const SUBJECTS = ['憲法', '行政法', '民法', '商法', '民事訴訟法', '刑法', '刑事訴訟法'];
+    const DEFAULT_NORMS = [
+      { subject: '憲法', title: '「表現の自由」の重要性', content: '表現の自由は、民主主義社会において自己実現及び自己統治の価値を有する極めて重要な人権である。' },
+      { subject: '刑法', title: '実行の着手（客観説）', content: '実行の着手とは、構成要件的結果発生の具体的危険性が認められる行為を開始した時点をいう。' },
+      { subject: '民法', title: '94条2項の類推適用', content: '相手方が虚偽の外観を信頼して取引をした場合、権利外観理論に基づき、本人の帰責性と外観の存在、相手方の信頼を要件として類推適用される。' }
+    ];
+    const TIME_LIMIT = 300;
+    const KEYBOARD_LAYOUT = [
+      ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '^', 'Backspace'],
+      ['Tab', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '@', '['],
+      ['CapsLock', 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ';', ':', ']'],
+      ['Shift', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', ',', '.', '/', '\\', 'Shift'],
+      ['Space']
+    ];
+
+    const Icon = ({ name, className }) => {
+      const iconRef = useRef(null);
+      useEffect(() => {
+        if (iconRef.current && window.lucide && window.lucide.icons[name]) {
+          window.lucide.createIcons({
+            icons: { [name]: window.lucide.icons[name] },
+            attrs: { class: className }
+          });
+        }
+      }, [name, className]);
+      return <span ref={iconRef} className="inline-flex items-center"></span>;
+    };
+
+    function App() {
+      const [user, setUser] = useState(null);
+      const [view, setView] = useState('home'); 
+      const [norms, setNorms] = useState(DEFAULT_NORMS);
+      const [currentNorm, setCurrentNorm] = useState(null);
+      const [selectedSubject, setSelectedSubject] = useState(SUBJECTS[0]);
+      
+      const [input, setInput] = useState('');
+      const [startTime, setStartTime] = useState(null);
+      const [timeLeft, setTimeLeft] = useState(TIME_LIMIT);
+      const [stats, setStats] = useState({ wpm: 0, accuracy: 100, time: 0 });
+      const [isFinished, setIsFinished] = useState(false);
+      const [isTimeUp, setIsTimeUp] = useState(false);
+      const [activeKeys, setActiveKeys] = useState(new Set());
+      
+      const timerRef = useRef(null);
+
+      // --- 認証初期化 ---
+      useEffect(() => {
+        if (!auth) return;
+        const initAuth = async () => {
+          try {
+            if (initialAuthToken) {
+              await auth.signInWithCustomToken(initialAuthToken);
+            } else {
+              await auth.signInAnonymously();
+            }
+          } catch (err) { console.error("Auth Error", err); }
+        };
+        initAuth();
+        const unsubscribe = auth.onAuthStateChanged(setUser);
+        return () => unsubscribe();
+      }, []);
+
+      // --- データ取得 ---
+      useEffect(() => {
+        if (!db || !user) return;
+        const q = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('norms');
+        const unsubscribe = q.onSnapshot((snapshot) => {
+          if (!snapshot.empty) {
+            const normsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setNorms(normsList);
+          }
+        }, (error) => console.error("Firestore Error", error));
+        return () => unsubscribe();
+      }, [user]);
+
+      // --- タイマーロジック ---
+      useEffect(() => {
+        if (startTime && !isFinished && !isTimeUp) {
+          timerRef.current = setInterval(() => {
+            setTimeLeft((prev) => {
+              if (prev <= 1) {
+                clearInterval(timerRef.current);
+                handleFinish(true);
+                return 0;
+              }
+              return prev - 1;
+            });
+          }, 1000);
+        }
+        return () => clearInterval(timerRef.current);
+      }, [startTime, isFinished, isTimeUp]);
+
+      // --- キーボードビジュアル ---
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          const key = e.key.toUpperCase();
+          setActiveKeys(prev => new Set(prev).add(key === " " ? "SPACE" : key));
+        };
+        const handleKeyUp = (e) => {
+          const key = e.key.toUpperCase();
+          setActiveKeys(prev => {
+            const next = new Set(prev);
+            next.delete(key === " " ? "SPACE" : key);
+            return next;
+          });
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        window.addEventListener('keyup', handleKeyUp);
+        return () => {
+          window.removeEventListener('keydown', handleKeyDown);
+          window.removeEventListener('keyup', handleKeyUp);
+        };
+      }, []);
+
+      const handleStartTyping = (norm) => {
+        setCurrentNorm(norm);
+        setInput('');
+        setStartTime(null);
+        setTimeLeft(TIME_LIMIT);
+        setIsFinished(false);
+        setIsTimeUp(false);
+        setStats({ wpm: 0, accuracy: 100, time: 0 });
+        setView('typing');
+      };
+
+      const handleFinish = (timeUp = false) => {
+        setIsFinished(true);
+        if (timeUp) setIsTimeUp(true);
+        const timeUsed = TIME_LIMIT - timeLeft;
+        const timeInMinutes = timeUp ? (TIME_LIMIT / 60) : (timeUsed / 60);
+        const finalWpm = Math.round(input.length / (timeInMinutes || 0.01));
+        
+        if (db && user) {
+          db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('results').add({
+            normTitle: currentNorm.title,
+            subject: currentNorm.subject,
+            wpm: finalWpm,
+            accuracy: stats.accuracy,
+            timestamp: firebase.firestore.FieldValue.serverTimestamp()
+          }).catch(console.error);
+        }
+      };
+
+      const handleInputChange = (e) => {
+        if (isFinished) return;
+        const val = e.target.value;
+        if (!startTime) setStartTime(Date.now());
+        setInput(val);
+        
+        const now = Date.now();
+        const timeInMinutes = (now - (startTime || now)) / 60000;
+        const wpm = timeInMinutes > 0 ? Math.round(val.length / timeInMinutes) : 0;
+        
+        let errors = 0;
+        for (let i = 0; i < val.length; i++) {
+          if (val[i] !== currentNorm.content[i]) errors++;
+        }
+        const accuracy = val.length > 0 ? Math.round(((val.length - errors) / val.length) * 100) : 100;
+        setStats({ wpm, accuracy, time: Math.floor((now - (startTime || now)) / 1000) });
+        
+        if (val === currentNorm.content) handleFinish(false);
+      };
+
+      const formatTime = (seconds) => {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+      };
+
+      const [newNorm, setNewNorm] = useState({ subject: SUBJECTS[0], title: '', content: '' });
+      const [editingId, setEditingId] = useState(null);
+
+      const handleSaveNorm = async () => {
+        if (!db || !newNorm.title || !newNorm.content) return;
+        const col = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('norms');
+        try {
+          if (editingId) {
+            await col.doc(editingId).update(newNorm);
+            setEditingId(null);
+          } else {
+            await col.add({ ...newNorm, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+          }
+          setNewNorm({ subject: SUBJECTS[0], title: '', content: '' });
+        } catch (e) { console.error("Admin error", e); }
+      };
+
+      const VirtualKeyboard = () => (
+        <div className="bg-slate-200 p-4 rounded-2xl shadow-inner mt-auto w-full max-w-4xl mx-auto border-t-4 border-slate-300 select-none hidden md:block">
+          <div className="flex flex-col gap-1.5">
+            {KEYBOARD_LAYOUT.map((row, rIdx) => (
+              <div key={rIdx} className="flex justify-center gap-1.5">
+                {row.map((key, kIdx) => {
+                  const isActive = activeKeys.has(key.toUpperCase());
+                  let w = "w-10 sm:w-12";
+                  if (key === "Backspace") w = "w-20 sm:w-24 text-[10px]";
+                  if (key === "Tab") w = "w-14 sm:w-16";
+                  if (key === "CapsLock") w = "w-16 sm:w-20";
+                  if (key === "Shift") w = "w-24 sm:w-28";
+                  if (key === "Space") w = "w-64 sm:w-80";
+                  return (
+                    <div key={kIdx} className={`${w} h-10 sm:h-12 flex items-center justify-center rounded-lg text-[10px] sm:text-xs font-bold transition-all ${isActive ? 'bg-blue-600 text-white transform translate-y-0.5 shadow-none' : 'bg-white text-slate-500 shadow-[0_3px_0_0_#cbd5e1]'}`}>
+                      {key}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+
+      return (
+        <div className="flex h-screen overflow-hidden flex-col md:flex-row">
+          {/* Sidebar */}
+          <aside className="w-full md:w-64 bg-slate-900 text-white flex flex-col shrink-0">
+            <div className="p-6 flex items-center gap-3 border-b border-slate-800">
+              <div className="bg-blue-600 p-2 rounded-lg"><Icon name="BookOpen" className="w-6 h-6" /></div>
+              <div><h1 className="font-bold text-lg leading-tight">司法試験CBT</h1><p className="text-xs text-slate-400">趣旨規範タイピング</p></div>
+            </div>
+            <nav className="flex flex-row md:flex-col p-4 space-x-2 md:space-x-0 md:space-y-2">
+              <button onClick={() => setView('home')} className={`flex-1 md:w-full flex items-center gap-3 px-4 py-3 rounded-lg transition ${view === 'home' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}>
+                <Icon name="Play" className="w-5 h-5" /><span>練習</span>
+              </button>
+              <button onClick={() => setView('admin')} className={`flex-1 md:w-full flex items-center gap-3 px-4 py-3 rounded-lg transition ${view === 'admin' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}>
+                <Icon name="Settings" className="w-5 h-5" /><span>管理</span>
+              </button>
+            </nav>
+          </aside>
+
+          {/* Main Area */}
+          <main className="flex-1 overflow-y-auto flex flex-col bg-slate-50">
+            {view === 'home' && (
+              <div className="p-4 md:p-8 max-w-5xl mx-auto w-full">
+                <header className="mb-8"><h2 className="text-2xl md:text-3xl font-bold mb-2">科目の選択</h2><p className="text-slate-500 font-medium text-sm">CBT試験形式に合わせたタイピング練習を行います。</p></header>
+                <div className="flex flex-wrap gap-2 mb-8">
+                  {SUBJECTS.map(s => (
+                    <button key={s} onClick={() => setSelectedSubject(s)} className={`px-4 py-2 rounded-full border-2 transition text-sm font-bold ${selectedSubject === s ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-slate-200 text-slate-600 hover:border-blue-400'}`}>{s}</button>
+                  ))}
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {norms.filter(n => n.subject === selectedSubject).map((norm, idx) => (
+                    <div key={norm.id || idx} className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm hover:shadow-md transition group">
+                      <div className="flex justify-between items-start mb-3">
+                        <span className="text-[10px] font-bold text-blue-600 uppercase bg-blue-50 px-2 py-1 rounded">{norm.subject}</span>
+                      </div>
+                      <h3 className="font-bold text-lg mb-2 line-clamp-1">{norm.title}</h3>
+                      <p className="text-slate-500 text-xs mb-4 line-clamp-2 h-8 leading-relaxed">{norm.content}</p>
+                      <button onClick={() => handleStartTyping(norm)} className="w-full flex items-center justify-center gap-2 bg-slate-100 group-hover:bg-blue-600 group-hover:text-white py-2 rounded-lg transition font-bold text-sm">練習開始 <Icon name="ChevronRight" className="w-4 h-4" /></button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {view === 'typing' && currentNorm && (
+              <div className="flex flex-col h-full bg-white relative">
+                <div className="h-1.5 w-full bg-slate-100"><div className={`h-full transition-all duration-1000 ease-linear ${timeLeft < 30 ? 'bg-red-500' : 'bg-blue-500'}`} style={{ width: `${(timeLeft / TIME_LIMIT) * 100}%` }}></div></div>
+                <div className="p-4 border-b flex flex-wrap justify-between items-center bg-slate-50 gap-4">
+                  <div className="flex items-center gap-4"><button onClick={() => setView('home')} className="text-slate-500 underline text-xs font-bold">中断</button><h3 className="font-bold text-sm">{currentNorm.title}</h3></div>
+                  <div className="flex items-center gap-4 md:gap-10">
+                    <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-slate-200 font-mono text-lg font-bold text-slate-700">
+                      <Icon name="Timer" className={`w-4 h-4 ${timeLeft < 30 ? 'text-red-500' : 'text-slate-400'}`} /> {formatTime(timeLeft)}
+                    </div>
+                    <div className="flex gap-4 md:gap-8">
+                      <div className="text-center"><div className="text-[10px] text-slate-400 font-bold">WPM</div><div className="font-mono text-lg md:text-xl font-bold text-blue-600">{stats.wpm}</div></div>
+                      <div className="text-center"><div className="text-[10px] text-slate-400 font-bold">ACC</div><div className="font-mono text-lg md:text-xl font-bold text-emerald-600">{stats.accuracy}%</div></div>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex-1 p-4 md:p-6 flex flex-col gap-4 md:gap-6 max-w-5xl mx-auto w-full">
+                  <div className="p-4 md:p-6 bg-slate-100 rounded-2xl relative shrink-0 text-lg md:text-2xl leading-relaxed text-slate-400 font-medium h-32 md:h-40 overflow-y-auto">
+                    {currentNorm.content.split('').map((char, i) => (
+                      <span key={i} className={`${i < input.length ? (input[i] === char ? 'text-slate-800' : 'text-red-500 bg-red-100') : ''} ${i === input.length ? 'char-current' : ''}`}>{char}</span>
+                    ))}
+                  </div>
+                  <textarea autoFocus value={input} onChange={handleInputChange} disabled={isFinished} className="flex-1 w-full p-4 md:p-6 text-lg md:text-2xl leading-relaxed border-2 rounded-2xl focus:outline-none focus:ring-4 focus:ring-blue-100 transition resize-none border-slate-200 font-medium" placeholder="入力を開始してください..." spellCheck="false" />
+                  <VirtualKeyboard />
+                </div>
+                {isFinished && (
+                  <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-[40px] p-10 max-w-md w-full shadow-2xl text-center">
+                      <h2 className="text-3xl font-black mb-2">{isTimeUp ? 'TIME UP!' : 'FINISH!'}</h2>
+                      <div className="grid grid-cols-2 gap-4 my-8">
+                        <div className="bg-slate-50 p-5 rounded-3xl"><div className="text-[10px] text-slate-400 font-bold uppercase">速度</div><div className="text-2xl font-black text-blue-600">{stats.wpm} WPM</div></div>
+                        <div className="bg-slate-50 p-5 rounded-3xl"><div className="text-[10px] text-slate-400 font-bold uppercase">正確性</div><div className="text-2xl font-black text-emerald-600">{stats.accuracy}%</div></div>
+                      </div>
+                      <button onClick={() => setView('home')} className="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold">戻る</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {view === 'admin' && (
+              <div className="p-4 md:p-8 max-w-5xl mx-auto w-full">
+                <header className="mb-8"><h2 className="text-2xl md:text-3xl font-bold mb-2">趣旨規範の管理</h2></header>
+                {!db ? (
+                  <div className="p-8 md:p-12 text-center bg-orange-50 text-orange-600 rounded-3xl border border-orange-200 font-bold">
+                    データベースが設定されていません。ローカルモードで動作中。
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm h-fit">
+                      <h3 className="font-bold mb-6">{editingId ? '規範を編集' : '新規追加'}</h3>
+                      <div className="space-y-4">
+                        <select value={newNorm.subject} onChange={(e) => setNewNorm({...newNorm, subject: e.target.value})} className="w-full p-3 bg-slate-50 border rounded-xl outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                          {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                        <input type="text" value={newNorm.title} onChange={(e) => setNewNorm({...newNorm, title: e.target.value})} className="w-full p-3 bg-slate-50 border rounded-xl text-sm" placeholder="タイトル" />
+                        <textarea rows={6} value={newNorm.content} onChange={(e) => setNewNorm({...newNorm, content: e.target.value})} className="w-full p-3 bg-slate-50 border rounded-xl resize-none text-sm" placeholder="論証本文" />
+                        <button onClick={handleSaveNorm} className="w-full bg-blue-600 text-white py-3 rounded-2xl font-bold hover:bg-blue-700 transition">保存する</button>
+                      </div>
+                    </div>
+                    <div className="lg:col-span-2 bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
+                      <table className="w-full text-left">
+                        <thead className="bg-slate-50 border-b text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                          <tr><th className="px-6 py-4">科目</th><th className="px-6 py-4">タイトル</th><th className="px-6 py-4 text-right">操作</th></tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {norms.map((norm, idx) => (
+                            <tr key={norm.id || idx} className="hover:bg-slate-50 transition">
+                              <td className="px-6 py-4"><span className="text-[10px] font-bold px-2 py-1 rounded bg-slate-100">{norm.subject}</span></td>
+                              <td className="px-6 py-4 font-bold text-sm">{norm.title}</td>
+                              <td className="px-6 py-4 text-right">
+                                <button onClick={() => { setEditingId(norm.id); setNewNorm(norm); }} className="p-2 text-slate-400 hover:text-blue-600 transition"><Icon name="Edit" className="w-4 h-4" /></button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </main>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
