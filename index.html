@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
@@ -22,7 +22,6 @@
     body { font-family: 'Inter', 'Noto Sans JP', sans-serif; }
     .line-clamp-1 { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
     .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-    /* スムーズなタイピングフィードバックのためのアニメーション */
     .char-current { border-bottom: 2px solid #3b82f6; animation: blink 1s infinite; }
     @keyframes blink { 0%, 100% { border-color: transparent; } 50% { border-color: #3b82f6; } }
   </style>
@@ -31,25 +30,19 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    // --- 環境変数の安全な初期化 ---
     let firebaseConfig = {};
     try {
       const rawConfig = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
       if (rawConfig) {
         firebaseConfig = typeof rawConfig === 'string' ? JSON.parse(rawConfig) : rawConfig;
       }
-    } catch (e) {
-      console.warn("Firebase configuration could not be loaded:", e);
-    }
+    } catch (e) { console.warn("Firebase configuration could not be loaded:", e); }
 
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'legal-typing-app';
     const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-    // Firebaseの初期化 (設定がある場合のみ)
     if (firebaseConfig && firebaseConfig.apiKey) {
-      if (!firebase.apps.length) {
-        firebase.initializeApp(firebaseConfig);
-      }
+      if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
     }
     
     const auth = firebase.apps.length ? firebase.auth() : null;
@@ -91,6 +84,8 @@
       const [norms, setNorms] = useState(DEFAULT_NORMS);
       const [currentNorm, setCurrentNorm] = useState(null);
       const [selectedSubject, setSelectedSubject] = useState(SUBJECTS[0]);
+      const [sheetUrl, setSheetUrl] = useState('');
+      const [isLoadingSheet, setIsLoadingSheet] = useState(false);
       
       const [input, setInput] = useState('');
       const [startTime, setStartTime] = useState(null);
@@ -102,16 +97,12 @@
       
       const timerRef = useRef(null);
 
-      // --- 認証初期化 ---
       useEffect(() => {
         if (!auth) return;
         const initAuth = async () => {
           try {
-            if (initialAuthToken) {
-              await auth.signInWithCustomToken(initialAuthToken);
-            } else {
-              await auth.signInAnonymously();
-            }
+            if (initialAuthToken) await auth.signInWithCustomToken(initialAuthToken);
+            else await auth.signInAnonymously();
           } catch (err) { console.error("Auth Error", err); }
         };
         initAuth();
@@ -119,20 +110,59 @@
         return () => unsubscribe();
       }, []);
 
-      // --- データ取得 ---
+      // スプレッドシート読み込み関数
+      const fetchFromSheet = async (url) => {
+        if (!url) return;
+        setIsLoadingSheet(true);
+        try {
+          // Google Sheets の CSV エクスポート URL に変換
+          const csvUrl = url.replace(/\/edit.*$/, '/export?format=csv');
+          const response = await fetch(csvUrl);
+          const csvText = await response.text();
+          
+          // 簡易CSVパース (1行目:科目, 2行目:タイトル, 3行目:内容)
+          const rows = csvText.split('\n').map(row => row.split(',').map(cell => cell.replace(/^"(.*)"$/, '$1').trim()));
+          const newNorms = rows.slice(1).filter(r => r.length >= 3 && r[0]).map((r, i) => ({
+            id: `sheet-${i}`,
+            subject: r[0],
+            title: r[1],
+            content: r[2]
+          }));
+          
+          if (newNorms.length > 0) {
+            setNorms(newNorms);
+            // Firestoreに保存（設定がある場合）
+            if (db && user) {
+              await db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('settings').doc('sheet').set({ url });
+            }
+          }
+        } catch (error) {
+          console.error("Sheet Sync Error:", error);
+        } finally {
+          setIsLoadingSheet(false);
+        }
+      };
+
       useEffect(() => {
         if (!db || !user) return;
+        // 保存済みURLの取得
+        db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('settings').doc('sheet').get().then(doc => {
+          if (doc.exists && doc.data().url) {
+            setSheetUrl(doc.data().url);
+            fetchFromSheet(doc.data().url);
+          }
+        });
+
         const q = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('norms');
         const unsubscribe = q.onSnapshot((snapshot) => {
           if (!snapshot.empty) {
             const normsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            setNorms(normsList);
+            setNorms(prev => [...normsList, ...prev.filter(n => n.id?.startsWith('sheet-'))]);
           }
-        }, (error) => console.error("Firestore Error", error));
+        });
         return () => unsubscribe();
       }, [user]);
 
-      // --- タイマーロジック ---
       useEffect(() => {
         if (startTime && !isFinished && !isTimeUp) {
           timerRef.current = setInterval(() => {
@@ -149,7 +179,6 @@
         return () => clearInterval(timerRef.current);
       }, [startTime, isFinished, isTimeUp]);
 
-      // --- キーボードビジュアル ---
       useEffect(() => {
         const handleKeyDown = (e) => {
           const key = e.key.toUpperCase();
@@ -205,18 +234,13 @@
         const val = e.target.value;
         if (!startTime) setStartTime(Date.now());
         setInput(val);
-        
         const now = Date.now();
         const timeInMinutes = (now - (startTime || now)) / 60000;
         const wpm = timeInMinutes > 0 ? Math.round(val.length / timeInMinutes) : 0;
-        
         let errors = 0;
-        for (let i = 0; i < val.length; i++) {
-          if (val[i] !== currentNorm.content[i]) errors++;
-        }
+        for (let i = 0; i < val.length; i++) if (val[i] !== currentNorm.content[i]) errors++;
         const accuracy = val.length > 0 ? Math.round(((val.length - errors) / val.length) * 100) : 100;
         setStats({ wpm, accuracy, time: Math.floor((now - (startTime || now)) / 1000) });
-        
         if (val === currentNorm.content) handleFinish(false);
       };
 
@@ -270,7 +294,6 @@
 
       return (
         <div className="flex h-screen overflow-hidden flex-col md:flex-row">
-          {/* Sidebar */}
           <aside className="w-full md:w-64 bg-slate-900 text-white flex flex-col shrink-0">
             <div className="p-6 flex items-center gap-3 border-b border-slate-800">
               <div className="bg-blue-600 p-2 rounded-lg"><Icon name="BookOpen" className="w-6 h-6" /></div>
@@ -286,11 +309,10 @@
             </nav>
           </aside>
 
-          {/* Main Area */}
           <main className="flex-1 overflow-y-auto flex flex-col bg-slate-50">
             {view === 'home' && (
               <div className="p-4 md:p-8 max-w-5xl mx-auto w-full">
-                <header className="mb-8"><h2 className="text-2xl md:text-3xl font-bold mb-2">科目の選択</h2><p className="text-slate-500 font-medium text-sm">CBT試験形式に合わせたタイピング練習を行います。</p></header>
+                <header className="mb-8"><h2 className="text-2xl md:text-3xl font-bold mb-2">科目の選択</h2><p className="text-slate-500 font-medium text-sm">スプレッドシートやデータベースから読み込まれた規範を練習します。</p></header>
                 <div className="flex flex-wrap gap-2 mb-8">
                   {SUBJECTS.map(s => (
                     <button key={s} onClick={() => setSelectedSubject(s)} className={`px-4 py-2 rounded-full border-2 transition text-sm font-bold ${selectedSubject === s ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-slate-200 text-slate-600 hover:border-blue-400'}`}>{s}</button>
@@ -301,6 +323,7 @@
                     <div key={norm.id || idx} className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm hover:shadow-md transition group">
                       <div className="flex justify-between items-start mb-3">
                         <span className="text-[10px] font-bold text-blue-600 uppercase bg-blue-50 px-2 py-1 rounded">{norm.subject}</span>
+                        {norm.id?.startsWith('sheet-') && <Icon name="FileSpreadsheet" className="w-3 h-3 text-emerald-500" />}
                       </div>
                       <h3 className="font-bold text-lg mb-2 line-clamp-1">{norm.title}</h3>
                       <p className="text-slate-500 text-xs mb-4 line-clamp-2 h-8 leading-relaxed">{norm.content}</p>
@@ -352,7 +375,43 @@
 
             {view === 'admin' && (
               <div className="p-4 md:p-8 max-w-5xl mx-auto w-full">
-                <header className="mb-8"><h2 className="text-2xl md:text-3xl font-bold mb-2">趣旨規範の管理</h2></header>
+                <header className="mb-8 flex justify-between items-center">
+                  <h2 className="text-2xl md:text-3xl font-bold">趣旨規範の管理</h2>
+                </header>
+
+                {/* スプレッドシート連携セクション */}
+                <div className="bg-emerald-50 border border-emerald-100 p-6 rounded-3xl mb-8">
+                  <div className="flex items-center gap-3 mb-4 text-emerald-700">
+                    <Icon name="FileSpreadsheet" className="w-6 h-6" />
+                    <h3 className="font-bold">Google スプレッドシートから読み込む</h3>
+                  </div>
+                  <p className="text-sm text-emerald-600 mb-4">
+                    スプレッドシートのURLを入力してください（閲覧権限が必要です）。<br/>
+                    1列目:科目, 2列目:タイトル, 3列目:本文 の形式で読み込みます。
+                  </p>
+                  <div className="flex gap-2">
+                    <input 
+                      type="text" 
+                      placeholder="https://docs.google.com/spreadsheets/d/..." 
+                      value={sheetUrl}
+                      onChange={(e) => setSheetUrl(e.target.value)}
+                      className="flex-1 p-3 rounded-xl border-emerald-200 border outline-none focus:ring-2 focus:ring-emerald-500 text-sm"
+                    />
+                    <button 
+                      onClick={() => fetchFromSheet(sheetUrl)}
+                      disabled={isLoadingSheet}
+                      className="bg-emerald-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-emerald-700 transition flex items-center gap-2 text-sm disabled:opacity-50"
+                    >
+                      {isLoadingSheet ? '読み込み中...' : '同期する'}
+                    </button>
+                    {sheetUrl && (
+                      <a href={sheetUrl} target="_blank" rel="noopener noreferrer" className="bg-white text-emerald-600 border border-emerald-200 px-4 py-3 rounded-xl flex items-center hover:bg-emerald-50">
+                        <Icon name="ExternalLink" className="w-5 h-5" />
+                      </a>
+                    )}
+                  </div>
+                </div>
+
                 {!db ? (
                   <div className="p-8 md:p-12 text-center bg-orange-50 text-orange-600 rounded-3xl border border-orange-200 font-bold">
                     データベースが設定されていません。ローカルモードで動作中。
@@ -373,7 +432,7 @@
                     <div className="lg:col-span-2 bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
                       <table className="w-full text-left">
                         <thead className="bg-slate-50 border-b text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                          <tr><th className="px-6 py-4">科目</th><th className="px-6 py-4">タイトル</th><th className="px-6 py-4 text-right">操作</th></tr>
+                          <tr><th className="px-6 py-4">科目</th><th className="px-6 py-4">タイトル</th><th className="px-6 py-4 text-right">ソース</th></tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                           {norms.map((norm, idx) => (
@@ -381,7 +440,11 @@
                               <td className="px-6 py-4"><span className="text-[10px] font-bold px-2 py-1 rounded bg-slate-100">{norm.subject}</span></td>
                               <td className="px-6 py-4 font-bold text-sm">{norm.title}</td>
                               <td className="px-6 py-4 text-right">
-                                <button onClick={() => { setEditingId(norm.id); setNewNorm(norm); }} className="p-2 text-slate-400 hover:text-blue-600 transition"><Icon name="Edit" className="w-4 h-4" /></button>
+                                {norm.id?.startsWith('sheet-') ? (
+                                  <span className="text-emerald-500 text-[10px] font-bold flex items-center justify-end gap-1"><Icon name="FileSpreadsheet" className="w-3 h-3" /> Sheet</span>
+                                ) : (
+                                  <button onClick={() => { setEditingId(norm.id); setNewNorm(norm); }} className="p-2 text-slate-400 hover:text-blue-600 transition"><Icon name="Edit" className="w-4 h-4" /></button>
+                                )}
                               </td>
                             </tr>
                           ))}
